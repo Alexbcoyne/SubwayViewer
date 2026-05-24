@@ -1,0 +1,17 @@
+[Unit]
+Description=NYC Train Viewer API + Web App
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/project-subwayviewer/server
+Environment=NODE_ENV=production
+Environment=PORT=3000
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=5
+User=pi
+Group=pi
+
+[Install]
+WantedBy=multi-user.target
