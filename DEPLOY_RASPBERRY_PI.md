@@ -91,7 +91,7 @@ npm run build
 Confirm build output exists:
 
 ```bash
-ls -la ~/project-subwayviewer/client/dist
+ls -la ~/SubwayViewer/client/dist
 ```
 
 You should see index.html and assets.
@@ -101,7 +101,7 @@ You should see index.html and assets.
 ## 5) Install Server Dependencies and Test Locally on Pi
 
 ```bash
-cd ~/project-subwayviewer/server
+cd ~/SubwayViewer/server
 npm install
 PORT=3000 npm run start
 ```
@@ -128,7 +128,7 @@ Important:
 Copy service template:
 
 ```bash
-sudo cp ~/project-subwayviewer/server/nyctrain.service.example /etc/systemd/system/nyctrain.service
+sudo cp ~/SubwayViewer/server/nyctrain.service.example /etc/systemd/system/nyctrain.service
 ```
 
 Reload and start:
@@ -227,6 +227,32 @@ npm install
 sudo systemctl restart nyctrain
 sudo systemctl status nyctrain --no-pager
 ```
+
+## 11) Auto-Deploy From GitHub
+
+If you want the Pi to pull new commits automatically and go live, use the deploy script and timer included in this repo.
+
+On the Pi:
+
+```bash
+cd ~/project-subwayviewer
+cp server/nyctrain-deploy.service.example /etc/systemd/system/nyctrain-deploy.service
+cp server/nyctrain-deploy.timer.example /etc/systemd/system/nyctrain-deploy.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now nyctrain-deploy.timer
+sudo systemctl status nyctrain-deploy.timer --no-pager
+```
+
+What it does:
+- checks GitHub for new commits every minute
+- pulls changes only when `origin/main` moved
+- rebuilds the client
+- refreshes server dependencies
+- restarts the `nyctrain` service so the site is live again
+
+The deploy service runs as root, but it performs the Git and build work as the `pi` user so the repository stays owned by your normal account.
+
+If you prefer manual deploys, keep this timer disabled and just run the quick routine above after each push.
 
 ---
 

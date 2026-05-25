@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for and deploy NYC Train Viewer updates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/pi/project-subwayviewer
+ExecStart=/bin/bash /home/pi/project-subwayviewer/scripts/deploy-on-pi.sh

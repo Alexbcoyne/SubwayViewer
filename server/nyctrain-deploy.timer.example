@@ -1,0 +1,11 @@
+[Unit]
+Description=Run NYC Train Viewer deploy checks automatically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=30s
+Unit=nyctrain-deploy.service
+
+[Install]
+WantedBy=timers.target
