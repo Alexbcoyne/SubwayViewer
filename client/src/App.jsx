@@ -12,7 +12,10 @@ const ANIMATION_TICK_MS = 200;
 const METERS_PER_DEG_LAT = 111320;
 const BACKWARD_PROGRESS_TOLERANCE = 0.03;
 const MOVING_POSITION_HOLD_MS = 12000;
+const MAX_TRAIN_SPEED_MPS = 45;
+const MIN_POSITION_STEP_METERS = 6;
 const MOVEMENT_STATE_CACHE = new Map();
+const MOTION_PLAN_SELECTION_CACHE = new Map();
 const DEFAULT_CENTER = [40.7128, -74.0060];
 const DEFAULT_ZOOM = 12;
 const LOCATE_ZOOM = 15;
@@ -169,10 +172,15 @@ function toRenderableTrainEntity(entity) {
     return null;
   }
 
+  const trainId = trip['.transit_realtime.nyctTripDescriptor']?.trainId || null;
+  const tripId = String(trip.tripId || '').trim() || null;
+  const stableId = String(trainId || (tripId ? `${routeId}:${tripId}` : '') || entity.id || `${routeId}-unknown`);
+
   return {
-    id: String(entity.id || `${routeId}-${trip.tripId || 'unknown'}`),
+    id: stableId,
     routeId,
-    trainId: trip['.transit_realtime.nyctTripDescriptor']?.trainId || null,
+    trainId,
+    tripId,
     latitude: position.latitude,
     longitude: position.longitude,
     positionSource: vehicle.positionSource || null,
@@ -182,7 +190,36 @@ function toRenderableTrainEntity(entity) {
     estimatedToStopId: vehicle.estimatedToStopId || null,
     estimatedSegmentStartSec: vehicle.estimatedSegmentStartSec ?? null,
     estimatedSegmentEndSec: vehicle.estimatedSegmentEndSec ?? null,
+    estimatedMinutesToNextStop: vehicle.estimatedMinutesToNextStop ?? null,
+    estimatedFirstStopId: vehicle.estimatedFirstStopId ?? null,
+    estimatedFirstStopDepartureSec: vehicle.estimatedFirstStopDepartureSec ?? null,
   };
+}
+
+function limitPositionStep(previousPosition, candidatePosition, previousUpdatedAtMs, nowMs) {
+  if (!previousPosition || !Array.isArray(candidatePosition)) {
+    return candidatePosition;
+  }
+
+  const dtMs = Math.max(ANIMATION_TICK_MS, nowMs - (previousUpdatedAtMs || nowMs));
+  const maxStepMeters = Math.max(MIN_POSITION_STEP_METERS, (dtMs / 1000) * MAX_TRAIN_SPEED_MPS);
+
+  const avgLat = (previousPosition[0] + candidatePosition[0]) / 2;
+  const prevXY = toXYMeters(previousPosition[0], previousPosition[1], avgLat);
+  const candXY = toXYMeters(candidatePosition[0], candidatePosition[1], avgLat);
+  const dx = candXY.x - prevXY.x;
+  const dy = candXY.y - prevXY.y;
+  const distance = Math.hypot(dx, dy);
+
+  if (!Number.isFinite(distance) || distance <= maxStepMeters) {
+    return candidatePosition;
+  }
+
+  const t = maxStepMeters / distance;
+  return [
+    previousPosition[0] + (candidatePosition[0] - previousPosition[0]) * t,
+    previousPosition[1] + (candidatePosition[1] - previousPosition[1]) * t,
+  ];
 }
 
 function getEstimatedSegmentKey(train) {
@@ -220,6 +257,18 @@ function getTimeProgress(train, nowMs) {
   const startMs = startSec * 1000;
   const endMs = endSec * 1000;
   return clamp((nowMs - startMs) / (endMs - startMs), 0.02, 0.98);
+}
+
+function formatUnixSeconds(seconds) {
+  const numeric = Number(seconds);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+
+  return new Date(numeric * 1000).toLocaleTimeString([], {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
 }
 
 function getAnimatedTrainPosition(train, nowMs, motionPlanByTrainId) {
@@ -272,15 +321,22 @@ function stabilizeEstimatedPosition(train, candidatePosition, nowMs, movementSta
     return previousState.position;
   }
 
+  const stabilizedCandidate = limitPositionStep(
+    previousState?.position,
+    candidatePosition,
+    previousState?.updatedAtMs,
+    nowMs
+  );
+
   stateMap.set(train.id, {
     segmentKey,
     progress,
-    position: candidatePosition,
+    position: stabilizedCandidate,
     updatedAtMs: nowMs,
     wasEstimated: true,
   });
 
-  return candidatePosition;
+  return stabilizedCandidate;
 }
 
 function stabilizeNonEstimatedPosition(train, candidatePosition, nowMs, movementState) {
@@ -295,15 +351,22 @@ function stabilizeNonEstimatedPosition(train, candidatePosition, nowMs, movement
     return previousState.position;
   }
 
+  const stabilizedCandidate = limitPositionStep(
+    previousState?.position,
+    candidatePosition,
+    previousState?.updatedAtMs,
+    nowMs
+  );
+
   stateMap.set(train.id, {
     segmentKey: null,
     progress: null,
-    position: candidatePosition,
+    position: stabilizedCandidate,
     updatedAtMs: nowMs,
     wasEstimated: false,
   });
 
-  return candidatePosition;
+  return stabilizedCandidate;
 }
 
 function toRenderableLineSegments(lines) {
@@ -585,7 +648,18 @@ const AnimatedTrainsPane = React.memo(function AnimatedTrainsPane({
             icon={getTrainBadgeIcon(routeId, routeColor)}
           >
             <Tooltip direction="top" offset={[0, -2]} opacity={0.95}>
-              {routeId} • {train.trainId || 'N/A'}
+              <div><strong>{routeId}</strong> • {train.trainId || 'N/A'}</div>
+              {Number.isFinite(train.estimatedMinutesToNextStop) ? (
+                <div>Next stop in {train.estimatedMinutesToNextStop} min</div>
+              ) : null}
+              {train.estimatedFirstStopId ? (
+                <div>
+                  Started from {train.estimatedFirstStopId}
+                  {formatUnixSeconds(train.estimatedFirstStopDepartureSec)
+                    ? ` at ${formatUnixSeconds(train.estimatedFirstStopDepartureSec)}`
+                    : ''}
+                </div>
+              ) : null}
             </Tooltip>
           </Marker>
         );
@@ -714,8 +788,11 @@ function App() {
 
   const motionPlanByTrainId = useMemo(() => {
     const plans = new Map();
+    const seenTrainIds = new Set();
 
     for (const train of trains) {
+      seenTrainIds.add(train.id);
+
       if (train.positionSource !== 'estimated_between_stops') {
         continue;
       }
@@ -731,6 +808,10 @@ function App() {
         continue;
       }
 
+      const segmentKey = getEstimatedSegmentKey(train);
+      const cachedSelection = MOTION_PLAN_SELECTION_CACHE.get(train.id) || null;
+      const canPreferCached = cachedSelection && segmentKey && cachedSelection.segmentKey === segmentKey;
+
       let best = null;
       for (const metrics of metricsList) {
         const fromProjection = projectPointToPolyline(metrics, fromLatLng);
@@ -740,7 +821,15 @@ function App() {
         }
 
         const alongDelta = Math.abs(toProjection.distanceAlong - fromProjection.distanceAlong);
-        const score = fromProjection.distance + toProjection.distance + (alongDelta < 5 ? 250 : 0);
+        let score = fromProjection.distance + toProjection.distance + (alongDelta < 5 ? 250 : 0);
+
+        if (canPreferCached && cachedSelection.metrics !== metrics) {
+          score += 160;
+        }
+
+        if (canPreferCached && cachedSelection.metrics === metrics) {
+          score -= 20;
+        }
 
         if (!best || score < best.score) {
           best = {
@@ -758,6 +847,18 @@ function App() {
           fromDistanceAlong: best.fromDistanceAlong,
           toDistanceAlong: best.toDistanceAlong,
         });
+
+        MOTION_PLAN_SELECTION_CACHE.set(train.id, {
+          metrics: best.metrics,
+          segmentKey,
+          updatedAtMs: Date.now(),
+        });
+      }
+    }
+
+    for (const trainId of MOTION_PLAN_SELECTION_CACHE.keys()) {
+      if (!seenTrainIds.has(trainId)) {
+        MOTION_PLAN_SELECTION_CACHE.delete(trainId);
       }
     }
 
@@ -947,6 +1048,7 @@ function App() {
   useEffect(() => {
     return () => {
       MOVEMENT_STATE_CACHE.clear();
+      MOTION_PLAN_SELECTION_CACHE.clear();
     };
   }, []);
 

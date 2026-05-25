@@ -28,6 +28,8 @@ const FEED_REFRESH_MS = 5000;
 const DEFAULT_SEGMENT_TRAVEL_SECONDS = 90;
 const MIN_IN_TRANSIT_PROGRESS = 0.08;
 const MAX_IN_TRANSIT_PROGRESS = 0.92;
+const PROGRESS_SMOOTHING_ALPHA = 0.45;
+const MAX_PROGRESS_STEP_PER_SECOND = 0.3;
 const VEHICLE_STATUS_IN_TRANSIT_TO = 2;
 
 // Configure Protobuf to handle imports automatically
@@ -59,6 +61,7 @@ let latestFeedMeta = {
 let feedRefreshInFlight = null;
 let feedRefreshTimer = null;
 const tripMotionState = new Map();
+const tripTimelineState = new Map();
 const TRIP_MOTION_TTL_MS = 30 * 60 * 1000;
 
 const ROUTE_COLOR_FALLBACK = {
@@ -286,6 +289,82 @@ function pruneTripMotionState(nowMs) {
             tripMotionState.delete(tripKey);
         }
     }
+
+    for (const [tripKey, state] of tripTimelineState.entries()) {
+        if (!state || !Number.isFinite(state.updatedAtMs)) {
+            tripTimelineState.delete(tripKey);
+            continue;
+        }
+
+        if (nowMs - state.updatedAtMs > TRIP_MOTION_TTL_MS) {
+            tripTimelineState.delete(tripKey);
+        }
+    }
+}
+
+function pickTimelineSegment(stopUpdates, nowSec) {
+    if (!Array.isArray(stopUpdates) || stopUpdates.length < 2) {
+        return null;
+    }
+
+    const segments = [];
+    for (let i = 0; i < stopUpdates.length - 1; i += 1) {
+        const fromUpdate = stopUpdates[i];
+        const toUpdate = stopUpdates[i + 1];
+        const startSec = fromUpdate.startSec ?? fromUpdate.endSec;
+        const endSec = toUpdate.endSec ?? toUpdate.startSec;
+
+        if (!Number.isFinite(startSec) || !Number.isFinite(endSec) || endSec <= startSec) {
+            continue;
+        }
+
+        segments.push({ fromUpdate, toUpdate, startSec, endSec });
+    }
+
+    if (!segments.length) {
+        return null;
+    }
+
+    let chosen = segments[segments.length - 1];
+    for (const segment of segments) {
+        if (nowSec <= segment.endSec) {
+            chosen = segment;
+            break;
+        }
+    }
+
+    return chosen;
+}
+
+function smoothSegmentProgress(tripKey, segmentKey, targetProgress, nowMs) {
+    const previous = tripTimelineState.get(tripKey);
+    const nowSec = nowMs / 1000;
+
+    if (!previous || previous.segmentKey !== segmentKey) {
+        const clamped = clamp(targetProgress, MIN_IN_TRANSIT_PROGRESS, MAX_IN_TRANSIT_PROGRESS);
+        tripTimelineState.set(tripKey, {
+            segmentKey,
+            progress: clamped,
+            updatedAtMs: nowMs,
+        });
+        return clamped;
+    }
+
+    const elapsedSec = Math.max(0, nowSec - previous.updatedAtMs / 1000);
+    const maxStep = Math.max(0.02, elapsedSec * MAX_PROGRESS_STEP_PER_SECOND);
+    const rawStep = targetProgress - previous.progress;
+    const limitedTarget = previous.progress + clamp(rawStep, -0.005, maxStep);
+    const monotonicTarget = Math.max(previous.progress, limitedTarget);
+    const smoothed = previous.progress + (monotonicTarget - previous.progress) * PROGRESS_SMOOTHING_ALPHA;
+    const clamped = clamp(smoothed, MIN_IN_TRANSIT_PROGRESS, MAX_IN_TRANSIT_PROGRESS);
+
+    tripTimelineState.set(tripKey, {
+        segmentKey,
+        progress: clamped,
+        updatedAtMs: nowMs,
+    });
+
+    return clamped;
 }
 
 function getTripKeyFromTripUpdate(tripUpdate) {
@@ -333,11 +412,6 @@ function applyTripUpdateEstimatedPosition(vehicle, tripUpdate, stopLookup, nowMs
         return false;
     }
 
-    const currentStopId = normalizeStopId(vehicle.stopId);
-    if (!currentStopId) {
-        return false;
-    }
-
     const nowSec = Math.floor(nowMs / 1000);
     const normalizedUpdates = stopUpdates
         .map((stopUpdate) => ({
@@ -350,20 +424,13 @@ function applyTripUpdateEstimatedPosition(vehicle, tripUpdate, stopLookup, nowMs
         return false;
     }
 
-    let fromIndex = normalizedUpdates.findIndex((stopUpdate) => stopUpdate.stopId === currentStopId);
-    if (fromIndex < 0) {
+    const segment = pickTimelineSegment(normalizedUpdates, nowSec);
+    if (!segment) {
         return false;
     }
 
-    if (fromIndex >= normalizedUpdates.length - 1) {
-        fromIndex = normalizedUpdates.length - 2;
-    }
-
-    const fromUpdate = normalizedUpdates[fromIndex];
-    const toUpdate = normalizedUpdates[fromIndex + 1];
-    if (!fromUpdate || !toUpdate) {
-        return false;
-    }
+    const fromUpdate = segment.fromUpdate;
+    const toUpdate = segment.toUpdate;
 
     const fromStop = lookupStop(stopLookup, fromUpdate.stopId);
     const toStop = lookupStop(stopLookup, toUpdate.stopId);
@@ -371,22 +438,34 @@ function applyTripUpdateEstimatedPosition(vehicle, tripUpdate, stopLookup, nowMs
         return false;
     }
 
-    let segmentStartSec = fromUpdate.startSec;
-    let segmentEndSec = toUpdate.endSec;
+    let segmentStartSec = segment.startSec;
+    let segmentEndSec = segment.endSec;
+    let progressTarget = getSegmentProgress(segmentStartSec, segmentEndSec, nowSec);
 
-    let progress = getSegmentProgress(segmentStartSec, segmentEndSec, nowSec);
-    if (!Number.isFinite(segmentStartSec) || !Number.isFinite(segmentEndSec)) {
+    if (!Number.isFinite(segmentStartSec) || !Number.isFinite(segmentEndSec) || segmentEndSec <= segmentStartSec) {
         // Time values are occasionally omitted; use a gentle default so trains appear between stops.
         segmentStartSec = nowSec;
         segmentEndSec = nowSec + DEFAULT_SEGMENT_TRAVEL_SECONDS;
-        progress = clamp((nowSec % DEFAULT_SEGMENT_TRAVEL_SECONDS) / DEFAULT_SEGMENT_TRAVEL_SECONDS, MIN_IN_TRANSIT_PROGRESS, MAX_IN_TRANSIT_PROGRESS);
+        progressTarget = clamp(
+            (nowSec % DEFAULT_SEGMENT_TRAVEL_SECONDS) / DEFAULT_SEGMENT_TRAVEL_SECONDS,
+            MIN_IN_TRANSIT_PROGRESS,
+            MAX_IN_TRANSIT_PROGRESS
+        );
     }
+
+    const tripKey = getTripMotionKey(vehicle) || getTripKeyFromTripUpdate(tripUpdate);
+    const segmentKey = `${fromUpdate.stopId}->${toUpdate.stopId}`;
+    const progress = tripKey
+        ? smoothSegmentProgress(tripKey, segmentKey, progressTarget, nowMs)
+        : progressTarget;
 
     vehicle.position = interpolatePosition(fromStop, toStop, progress);
     vehicle.positionSource = 'estimated_between_stops';
     vehicle.estimatedProgress = Number(progress.toFixed(3));
+    vehicle.estimatedProgressRaw = Number(progressTarget.toFixed(3));
     vehicle.estimatedFromStopId = fromUpdate.stopId;
     vehicle.estimatedToStopId = toUpdate.stopId;
+    vehicle.estimatedNextStopId = toUpdate.stopId;
     vehicle.estimatedFromPosition = {
         latitude: fromStop.latitude,
         longitude: fromStop.longitude,
@@ -397,7 +476,12 @@ function applyTripUpdateEstimatedPosition(vehicle, tripUpdate, stopLookup, nowMs
     };
     vehicle.estimatedSegmentStartSec = segmentStartSec;
     vehicle.estimatedSegmentEndSec = segmentEndSec;
+    vehicle.estimatedMinutesToNextStop = Number(Math.max(0, (segmentEndSec - nowSec) / 60).toFixed(1));
+    const firstStop = normalizedUpdates[0] || null;
+    vehicle.estimatedFirstStopId = firstStop?.stopId || null;
+    vehicle.estimatedFirstStopDepartureSec = firstStop?.startSec ?? firstStop?.endSec ?? null;
     vehicle.estimatedComputedAtMs = nowMs;
+    vehicle.estimatedScheduleBased = true;
     return true;
 }
 
