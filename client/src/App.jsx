@@ -292,15 +292,33 @@ function getAnimatedTrainPosition(train, nowMs, motionPlanByTrainId) {
     }
   }
 
-  const from = train.estimatedFromPosition;
-  const to = train.estimatedToPosition;
-  if (!from || !to) {
-    return [train.latitude, train.longitude];
+  // Keep estimated trains anchored to known track geometry when no motion plan exists.
+  return [train.latitude, train.longitude];
+}
+
+function routeIdCandidates(routeId) {
+  const raw = String(routeId || '').trim().toUpperCase();
+  if (!raw) {
+    return [];
   }
 
-  const latitude = from.latitude + (to.latitude - from.latitude) * progress;
-  const longitude = from.longitude + (to.longitude - from.longitude) * progress;
-  return [latitude, longitude];
+  const candidates = new Set([raw]);
+  candidates.add(raw.replace(/X$/, ''));
+  candidates.add(raw.replace(/[^A-Z0-9]/g, ''));
+
+  return Array.from(candidates).filter(Boolean);
+}
+
+function getMetricsListForRoute(routePathMetrics, routeId) {
+  const candidates = routeIdCandidates(routeId);
+  for (const candidate of candidates) {
+    const metricsList = routePathMetrics.get(candidate);
+    if (Array.isArray(metricsList) && metricsList.length) {
+      return metricsList;
+    }
+  }
+
+  return null;
 }
 
 function stabilizeEstimatedPosition(train, candidatePosition, nowMs, movementState) {
@@ -776,11 +794,17 @@ function App() {
     const byRoute = new Map();
 
     for (const segment of lineSegments) {
-      if (!byRoute.has(segment.routeId)) {
-        byRoute.set(segment.routeId, []);
+      const aliases = routeIdCandidates(segment.routeId);
+      for (const alias of aliases) {
+        if (!byRoute.has(alias)) {
+          byRoute.set(alias, []);
+        }
       }
 
-      byRoute.get(segment.routeId).push(buildPathMetrics(segment.path));
+      const metrics = buildPathMetrics(segment.path);
+      for (const alias of aliases) {
+        byRoute.get(alias).push(metrics);
+      }
     }
 
     return byRoute;
@@ -803,7 +827,10 @@ function App() {
         continue;
       }
 
-      const metricsList = routePathMetrics.get(train.routeId);
+      let metricsList = getMetricsListForRoute(routePathMetrics, train.routeId);
+      if ((!metricsList || !metricsList.length) && routePathMetrics.size) {
+        metricsList = Array.from(routePathMetrics.values())[0];
+      }
       if (!Array.isArray(metricsList) || !metricsList.length) {
         continue;
       }
