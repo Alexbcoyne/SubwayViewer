@@ -8,7 +8,24 @@ const AdmZip = require('adm-zip');
 const { parse } = require('csv-parse/sync');
 
 const app = express();
-app.use(cors());
+
+const corsAllowList = String(process.env.CORS_ALLOWLIST || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+app.use(
+    cors({
+        origin(origin, callback) {
+            if (!origin || corsAllowList.length === 0) {
+                callback(null, true);
+                return;
+            }
+
+            callback(null, corsAllowList.includes(origin));
+        },
+    })
+);
 const PORT = Number(process.env.PORT) || 3000;
 const CLIENT_DIST_DIR = path.resolve(__dirname, '../client/dist');
 
@@ -74,6 +91,7 @@ const tripStopObservationState = new Map();
 const historicalSegmentProfiles = new Map();
 let historicalProfilesDirty = false;
 let historicalPersistTimer = null;
+let historicalPersistInFlight = false;
 const TRIP_MOTION_TTL_MS = 30 * 60 * 1000;
 
 const ROUTE_COLOR_FALLBACK = {
@@ -237,14 +255,16 @@ function loadHistoricalProfilesFromDisk() {
     }
 }
 
-function persistHistoricalProfilesToDisk() {
-    if (!historicalProfilesDirty) {
+async function persistHistoricalProfilesToDisk() {
+    if (!historicalProfilesDirty || historicalPersistInFlight) {
         return;
     }
 
+    historicalPersistInFlight = true;
+
     try {
         const dir = path.dirname(HISTORICAL_STORE_PATH);
-        fs.mkdirSync(dir, { recursive: true });
+        await fs.promises.mkdir(dir, { recursive: true });
 
         const payload = {
             savedAt: new Date().toISOString(),
@@ -257,10 +277,14 @@ function persistHistoricalProfilesToDisk() {
             })),
         };
 
-        fs.writeFileSync(HISTORICAL_STORE_PATH, JSON.stringify(payload));
+        const tempPath = `${HISTORICAL_STORE_PATH}.tmp`;
+        await fs.promises.writeFile(tempPath, JSON.stringify(payload), 'utf8');
+        await fs.promises.rename(tempPath, HISTORICAL_STORE_PATH);
         historicalProfilesDirty = false;
     } catch (error) {
         console.error('Failed to persist historical segment profiles:', error.message);
+    } finally {
+        historicalPersistInFlight = false;
     }
 }
 
@@ -1078,7 +1102,7 @@ async function refreshFeedSnapshot(source = 'interval') {
         const stopLookup = await getStopsLookup();
         const nowMs = Date.now();
 
-        const feedResponses = await Promise.all(
+        const feedResponses = await Promise.allSettled(
             MTA_FEED_URLS.map((url) =>
                 axios.get(url, {
                     responseType: 'arraybuffer',
@@ -1087,7 +1111,17 @@ async function refreshFeedSnapshot(source = 'interval') {
             )
         );
 
-        const decodedFeeds = feedResponses.map((response) =>
+        const fulfilledFeedResponses = feedResponses
+            .filter((result) => result.status === 'fulfilled')
+            .map((result) => result.value);
+
+        if (!fulfilledFeedResponses.length) {
+            throw new Error('All realtime feed fetches failed');
+        }
+
+        const failedFeedCount = feedResponses.length - fulfilledFeedResponses.length;
+
+        const decodedFeeds = fulfilledFeedResponses.map((response) =>
             FeedMessage.decode(new Uint8Array(response.data))
         );
 
@@ -1134,6 +1168,7 @@ async function refreshFeedSnapshot(source = 'interval') {
             updatedAt: new Date(nowMs).toISOString(),
             source,
             feedCount: decodedFeeds.length,
+            failedFeedCount,
             mergedEntities: mergedEntities.length,
             dedupedEntities: entities.length,
             withGps,
@@ -1142,7 +1177,7 @@ async function refreshFeedSnapshot(source = 'interval') {
         };
 
         console.log(
-            `Snapshot updated. source=${source}, feedCount=${decodedFeeds.length}, entities=${entities.length}, GPS=${withGps}, estimated=${estimatedInTransit}, stopFallback=${stopFallback}`
+            `Snapshot updated. source=${source}, feedCount=${decodedFeeds.length}, failedFeedCount=${failedFeedCount}, entities=${entities.length}, GPS=${withGps}, estimated=${estimatedInTransit}, stopFallback=${stopFallback}`
         );
     })();
 
@@ -1226,21 +1261,31 @@ startFeedRefreshLoop();
 
 loadHistoricalProfilesFromDisk();
 historicalPersistTimer = setInterval(() => {
-    persistHistoricalProfilesToDisk();
+    persistHistoricalProfilesToDisk().catch((error) => {
+        console.error('Historical profile persist tick failed:', error.message);
+    });
 }, HISTORICAL_PROFILE_PERSIST_MS);
 
 process.on('beforeExit', () => {
-    persistHistoricalProfilesToDisk();
+    persistHistoricalProfilesToDisk().catch(() => {
+        // ignore errors during process shutdown
+    });
 });
 
 process.on('SIGINT', () => {
-    persistHistoricalProfilesToDisk();
-    process.exit(0);
+    persistHistoricalProfilesToDisk()
+        .catch(() => {
+            // ignore errors during process shutdown
+        })
+        .finally(() => process.exit(0));
 });
 
 process.on('SIGTERM', () => {
-    persistHistoricalProfilesToDisk();
-    process.exit(0);
+    persistHistoricalProfilesToDisk()
+        .catch(() => {
+            // ignore errors during process shutdown
+        })
+        .finally(() => process.exit(0));
 });
 
 app.listen(PORT, () => {

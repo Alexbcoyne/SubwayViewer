@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/pi/project-subwayviewer/server
+WorkingDirectory=/home/%u/project-subwayviewer/server
 Environment=NODE_ENV=production
 Environment=PORT=3000
 ExecStart=/usr/bin/npm run start

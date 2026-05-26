@@ -1,1 +1,7 @@
-DEPLOY_RASPBERRY_PI.md
+.DS_Store
+node_modules/
+client/node_modules/
+server/node_modules/
+client/dist/
+server/data/
+*.log

@@ -828,9 +828,6 @@ function App() {
       }
 
       let metricsList = getMetricsListForRoute(routePathMetrics, train.routeId);
-      if ((!metricsList || !metricsList.length) && routePathMetrics.size) {
-        metricsList = Array.from(routePathMetrics.values())[0];
-      }
       if (!Array.isArray(metricsList) || !metricsList.length) {
         continue;
       }

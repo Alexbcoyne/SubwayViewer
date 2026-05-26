@@ -6,5 +6,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=root
-WorkingDirectory=/home/pi/project-subwayviewer
-ExecStart=/bin/bash /home/pi/project-subwayviewer/scripts/deploy-on-pi.sh
+Environment=DEPLOY_REPO_ROOT=/home/pi/project-subwayviewer
+Environment=DEPLOY_USER=pi
+Environment=DEPLOY_BRANCH=main
+WorkingDirectory=${DEPLOY_REPO_ROOT}
+ExecStart=/bin/bash ${DEPLOY_REPO_ROOT}/scripts/deploy-on-pi.sh

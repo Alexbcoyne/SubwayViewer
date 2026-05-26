@@ -91,7 +91,7 @@ npm run build
 Confirm build output exists:
 
 ```bash
-ls -la ~/SubwayViewer/client/dist
+ls -la ~/project-subwayviewer/client/dist
 ```
 
 You should see index.html and assets.
@@ -101,7 +101,7 @@ You should see index.html and assets.
 ## 5) Install Server Dependencies and Test Locally on Pi
 
 ```bash
-cd ~/SubwayViewer/server
+cd ~/project-subwayviewer/server
 npm install
 PORT=3000 npm run start
 ```
@@ -128,7 +128,7 @@ Important:
 Copy service template:
 
 ```bash
-sudo cp ~/SubwayViewer/server/nyctrain.service.example /etc/systemd/system/nyctrain.service
+sudo cp ~/project-subwayviewer/server/nyctrain.service.example /etc/systemd/system/nyctrain.service
 ```
 
 Reload and start:
@@ -238,6 +238,11 @@ On the Pi:
 cd ~/project-subwayviewer
 cp server/nyctrain-deploy.service.example /etc/systemd/system/nyctrain-deploy.service
 cp server/nyctrain-deploy.timer.example /etc/systemd/system/nyctrain-deploy.timer
+
+# Optional: override defaults for username/repo path/branch
+# sudo editor /etc/systemd/system/nyctrain-deploy.service
+# Set DEPLOY_REPO_ROOT, DEPLOY_USER, DEPLOY_BRANCH to your environment.
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now nyctrain-deploy.timer
 sudo systemctl status nyctrain-deploy.timer --no-pager
