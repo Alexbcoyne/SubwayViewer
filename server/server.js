@@ -30,6 +30,14 @@ const MIN_IN_TRANSIT_PROGRESS = 0.08;
 const MAX_IN_TRANSIT_PROGRESS = 0.92;
 const PROGRESS_SMOOTHING_ALPHA = 0.45;
 const MAX_PROGRESS_STEP_PER_SECOND = 0.3;
+const HISTORICAL_BUCKET_MINUTES = 15;
+const HISTORICAL_PROFILE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const HISTORICAL_PROFILE_PERSIST_MS = 60 * 1000;
+const HISTORICAL_MIN_DURATION_SEC = 20;
+const HISTORICAL_MAX_DURATION_SEC = 900;
+const HISTORICAL_EWMA_ALPHA = 0.2;
+const HISTORICAL_MIN_SAMPLES_FOR_FULL_WEIGHT = 25;
+const HISTORICAL_STORE_PATH = process.env.HISTORICAL_STORE_PATH || path.resolve(__dirname, 'data', 'segment-profiles.json');
 const VEHICLE_STATUS_IN_TRANSIT_TO = 2;
 
 // Configure Protobuf to handle imports automatically
@@ -62,6 +70,10 @@ let feedRefreshInFlight = null;
 let feedRefreshTimer = null;
 const tripMotionState = new Map();
 const tripTimelineState = new Map();
+const tripStopObservationState = new Map();
+const historicalSegmentProfiles = new Map();
+let historicalProfilesDirty = false;
+let historicalPersistTimer = null;
 const TRIP_MOTION_TTL_MS = 30 * 60 * 1000;
 
 const ROUTE_COLOR_FALLBACK = {
@@ -177,6 +189,194 @@ function clonePlain(value) {
     }
 
     return JSON.parse(JSON.stringify(value));
+}
+
+function getHistoricalBucketKey(nowMs) {
+    const dt = new Date(nowMs);
+    const day = dt.getUTCDay();
+    const minutes = dt.getUTCHours() * 60 + dt.getUTCMinutes();
+    const slot = Math.floor(minutes / HISTORICAL_BUCKET_MINUTES);
+    return `d${day}-s${slot}`;
+}
+
+function getHistoricalProfileKey(routeId, fromStopId, toStopId, bucketKey) {
+    return `${routeId}|${fromStopId}|${toStopId}|${bucketKey}`;
+}
+
+function loadHistoricalProfilesFromDisk() {
+    try {
+        if (!fs.existsSync(HISTORICAL_STORE_PATH)) {
+            return;
+        }
+
+        const raw = fs.readFileSync(HISTORICAL_STORE_PATH, 'utf8');
+        const parsed = JSON.parse(raw);
+        const records = Array.isArray(parsed?.profiles) ? parsed.profiles : [];
+
+        for (const record of records) {
+            const key = String(record?.key || '').trim();
+            if (!key) continue;
+
+            const ewmaSec = Number(record?.ewmaSec);
+            const sampleCount = Number(record?.sampleCount);
+            const lastObservedAtMs = Number(record?.lastObservedAtMs);
+            if (!Number.isFinite(ewmaSec) || !Number.isFinite(sampleCount) || !Number.isFinite(lastObservedAtMs)) {
+                continue;
+            }
+
+            historicalSegmentProfiles.set(key, {
+                ewmaSec,
+                sampleCount,
+                lastObservedAtMs,
+            });
+        }
+
+        console.log(`Loaded ${historicalSegmentProfiles.size} historical segment profiles from disk.`);
+    } catch (error) {
+        console.error('Failed to load historical segment profiles:', error.message);
+    }
+}
+
+function persistHistoricalProfilesToDisk() {
+    if (!historicalProfilesDirty) {
+        return;
+    }
+
+    try {
+        const dir = path.dirname(HISTORICAL_STORE_PATH);
+        fs.mkdirSync(dir, { recursive: true });
+
+        const payload = {
+            savedAt: new Date().toISOString(),
+            profileCount: historicalSegmentProfiles.size,
+            profiles: Array.from(historicalSegmentProfiles.entries()).map(([key, profile]) => ({
+                key,
+                ewmaSec: profile.ewmaSec,
+                sampleCount: profile.sampleCount,
+                lastObservedAtMs: profile.lastObservedAtMs,
+            })),
+        };
+
+        fs.writeFileSync(HISTORICAL_STORE_PATH, JSON.stringify(payload));
+        historicalProfilesDirty = false;
+    } catch (error) {
+        console.error('Failed to persist historical segment profiles:', error.message);
+    }
+}
+
+function updateHistoricalSegmentProfile(routeId, fromStopId, toStopId, observedDurationSec, nowMs) {
+    if (!routeId || !fromStopId || !toStopId) {
+        return;
+    }
+
+    if (!Number.isFinite(observedDurationSec)) {
+        return;
+    }
+
+    const clampedDuration = clamp(observedDurationSec, HISTORICAL_MIN_DURATION_SEC, HISTORICAL_MAX_DURATION_SEC);
+    const bucketKey = getHistoricalBucketKey(nowMs);
+    const profileKey = getHistoricalProfileKey(routeId, fromStopId, toStopId, bucketKey);
+    const previous = historicalSegmentProfiles.get(profileKey);
+
+    if (!previous) {
+        historicalSegmentProfiles.set(profileKey, {
+            ewmaSec: clampedDuration,
+            sampleCount: 1,
+            lastObservedAtMs: nowMs,
+        });
+        historicalProfilesDirty = true;
+        return;
+    }
+
+    previous.ewmaSec =
+        previous.ewmaSec + (clampedDuration - previous.ewmaSec) * HISTORICAL_EWMA_ALPHA;
+    previous.sampleCount += 1;
+    previous.lastObservedAtMs = nowMs;
+    historicalProfilesDirty = true;
+}
+
+function getHistoricalDurationEstimate(routeId, fromStopId, toStopId, nowMs) {
+    if (!routeId || !fromStopId || !toStopId) {
+        return null;
+    }
+
+    const exactBucket = getHistoricalBucketKey(nowMs);
+    const exactKey = getHistoricalProfileKey(routeId, fromStopId, toStopId, exactBucket);
+    const exact = historicalSegmentProfiles.get(exactKey);
+    if (exact && Number.isFinite(exact.ewmaSec)) {
+        return {
+            expectedSec: exact.ewmaSec,
+            sampleCount: exact.sampleCount,
+            source: 'exact_bucket',
+        };
+    }
+
+    const prefix = `${routeId}|${fromStopId}|${toStopId}|`;
+    let weightedSum = 0;
+    let totalWeight = 0;
+    let totalSamples = 0;
+
+    for (const [key, profile] of historicalSegmentProfiles.entries()) {
+        if (!key.startsWith(prefix)) {
+            continue;
+        }
+
+        if (!Number.isFinite(profile?.ewmaSec) || !Number.isFinite(profile?.sampleCount)) {
+            continue;
+        }
+
+        const sampleWeight = Math.min(profile.sampleCount, HISTORICAL_MIN_SAMPLES_FOR_FULL_WEIGHT);
+        weightedSum += profile.ewmaSec * sampleWeight;
+        totalWeight += sampleWeight;
+        totalSamples += profile.sampleCount;
+    }
+
+    if (totalWeight <= 0) {
+        return null;
+    }
+
+    return {
+        expectedSec: weightedSum / totalWeight,
+        sampleCount: totalSamples,
+        source: 'all_buckets',
+    };
+}
+
+function observeTripSegmentDurations(vehicle, nowMs) {
+    const tripKey = getTripMotionKey(vehicle);
+    const routeId = String(vehicle?.trip?.routeId || '').trim();
+    const currentStopId = normalizeStopId(vehicle?.stopId);
+
+    if (!tripKey || !routeId || !currentStopId) {
+        return;
+    }
+
+    const previous = tripStopObservationState.get(tripKey) || null;
+    if (!previous) {
+        tripStopObservationState.set(tripKey, {
+            routeId,
+            stopId: currentStopId,
+            observedAtMs: nowMs,
+        });
+        return;
+    }
+
+    if (previous.stopId === currentStopId) {
+        previous.observedAtMs = nowMs;
+        previous.routeId = routeId;
+        return;
+    }
+
+    const durationSec = (nowMs - previous.observedAtMs) / 1000;
+    if (Number.isFinite(durationSec) && durationSec >= HISTORICAL_MIN_DURATION_SEC && durationSec <= HISTORICAL_MAX_DURATION_SEC) {
+        updateHistoricalSegmentProfile(routeId, previous.stopId, currentStopId, durationSec, nowMs);
+    }
+
+    tripStopObservationState.set(tripKey, {
+        routeId,
+        stopId: currentStopId,
+        observedAtMs: nowMs,
+    });
 }
 
 function mergeEntityRecords(existingEntity, incomingEntity) {
@@ -299,6 +499,35 @@ function pruneTripMotionState(nowMs) {
         if (nowMs - state.updatedAtMs > TRIP_MOTION_TTL_MS) {
             tripTimelineState.delete(tripKey);
         }
+    }
+
+    for (const [tripKey, state] of tripStopObservationState.entries()) {
+        if (!state || !Number.isFinite(state.observedAtMs)) {
+            tripStopObservationState.delete(tripKey);
+            continue;
+        }
+
+        if (nowMs - state.observedAtMs > TRIP_MOTION_TTL_MS) {
+            tripStopObservationState.delete(tripKey);
+        }
+    }
+
+    let historicalRemoved = 0;
+    for (const [profileKey, profile] of historicalSegmentProfiles.entries()) {
+        if (!profile || !Number.isFinite(profile.lastObservedAtMs)) {
+            historicalSegmentProfiles.delete(profileKey);
+            historicalRemoved += 1;
+            continue;
+        }
+
+        if (nowMs - profile.lastObservedAtMs > HISTORICAL_PROFILE_RETENTION_MS) {
+            historicalSegmentProfiles.delete(profileKey);
+            historicalRemoved += 1;
+        }
+    }
+
+    if (historicalRemoved > 0) {
+        historicalProfilesDirty = true;
     }
 }
 
@@ -438,19 +667,32 @@ function applyTripUpdateEstimatedPosition(vehicle, tripUpdate, stopLookup, nowMs
         return false;
     }
 
+    const routeId = String(vehicle?.trip?.routeId || '').trim();
+    const historicalEstimate = getHistoricalDurationEstimate(routeId, fromUpdate.stopId, toUpdate.stopId, nowMs);
+
     let segmentStartSec = segment.startSec;
     let segmentEndSec = segment.endSec;
     let progressTarget = getSegmentProgress(segmentStartSec, segmentEndSec, nowSec);
 
     if (!Number.isFinite(segmentStartSec) || !Number.isFinite(segmentEndSec) || segmentEndSec <= segmentStartSec) {
-        // Time values are occasionally omitted; use a gentle default so trains appear between stops.
+        // Time values are occasionally omitted; use historical expectations when available.
+        const fallbackDuration = historicalEstimate?.expectedSec || DEFAULT_SEGMENT_TRAVEL_SECONDS;
         segmentStartSec = nowSec;
-        segmentEndSec = nowSec + DEFAULT_SEGMENT_TRAVEL_SECONDS;
+        segmentEndSec = nowSec + fallbackDuration;
         progressTarget = clamp(
-            (nowSec % DEFAULT_SEGMENT_TRAVEL_SECONDS) / DEFAULT_SEGMENT_TRAVEL_SECONDS,
+            (nowSec % fallbackDuration) / fallbackDuration,
             MIN_IN_TRANSIT_PROGRESS,
             MAX_IN_TRANSIT_PROGRESS
         );
+    } else if (historicalEstimate?.expectedSec) {
+        const scheduleDuration = segmentEndSec - segmentStartSec;
+        const blendedDuration = clamp(
+            scheduleDuration * 0.65 + historicalEstimate.expectedSec * 0.35,
+            HISTORICAL_MIN_DURATION_SEC,
+            HISTORICAL_MAX_DURATION_SEC
+        );
+        segmentEndSec = segmentStartSec + blendedDuration;
+        progressTarget = getSegmentProgress(segmentStartSec, segmentEndSec, nowSec);
     }
 
     const tripKey = getTripMotionKey(vehicle) || getTripKeyFromTripUpdate(tripUpdate);
@@ -482,6 +724,11 @@ function applyTripUpdateEstimatedPosition(vehicle, tripUpdate, stopLookup, nowMs
     vehicle.estimatedFirstStopDepartureSec = firstStop?.startSec ?? firstStop?.endSec ?? null;
     vehicle.estimatedComputedAtMs = nowMs;
     vehicle.estimatedScheduleBased = true;
+    vehicle.estimatedHistoricalDurationSec = historicalEstimate
+        ? Number(historicalEstimate.expectedSec.toFixed(1))
+        : null;
+    vehicle.estimatedHistoricalSampleCount = historicalEstimate?.sampleCount || 0;
+    vehicle.estimatedHistoricalSource = historicalEstimate?.source || null;
     return true;
 }
 
@@ -864,6 +1111,7 @@ async function refreshFeedSnapshot(source = 'interval') {
         for (const entity of entities) {
             const vehicle = entity.vehicle;
             const sourceUsed = enrichVehiclePosition(vehicle, tripUpdatesByTripKey, stopLookup, nowMs);
+            observeTripSegmentDurations(vehicle, nowMs);
             if (sourceUsed === 'gps') {
                 withGps += 1;
                 continue;
@@ -975,6 +1223,25 @@ if (fs.existsSync(path.join(CLIENT_DIST_DIR, 'index.html'))) {
 }
 
 startFeedRefreshLoop();
+
+loadHistoricalProfilesFromDisk();
+historicalPersistTimer = setInterval(() => {
+    persistHistoricalProfilesToDisk();
+}, HISTORICAL_PROFILE_PERSIST_MS);
+
+process.on('beforeExit', () => {
+    persistHistoricalProfilesToDisk();
+});
+
+process.on('SIGINT', () => {
+    persistHistoricalProfilesToDisk();
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    persistHistoricalProfilesToDisk();
+    process.exit(0);
+});
 
 app.listen(PORT, () => {
     console.log(`Translator server running on http://localhost:${PORT}`);
